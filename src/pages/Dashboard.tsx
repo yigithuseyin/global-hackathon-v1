@@ -90,7 +90,7 @@ const Dashboard = () => {
 
     userQuery += "\n\nMaterial to study:\n" + content;
 
-    const apiKey = "AIzaSyDu_ys_7SGH1FEBz7eFL6-hJiDZrRS4AeA";  
+    const apiKey = "API_KEY_HERE"; // Replace with your actual API key
     const model = "gemini-2.5-flash-preview-05-20";
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
