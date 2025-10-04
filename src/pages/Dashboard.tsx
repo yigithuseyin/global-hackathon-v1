@@ -2,16 +2,31 @@ import { useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { Brain, Upload, FileText, Eye, Target, Lightbulb, Sparkles, TrendingUp } from "lucide-react";
+import { Brain, Upload, FileText, Eye, Target, Lightbulb, Sparkles, TrendingUp, RotateCw } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
+
+// Define the structure for the AI output
+interface GeneratedOutput {
+  text: string;
+  style: string;
+  sources: { uri: string; title: string }[];
+}
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
+  // Retrieve learning style, default to 'visual'
   const learningStyle = localStorage.getItem("learningStyle") || "visual";
-  const [uploadedFiles] = useState<string[]>([]);
+  
+  // State for tracking successfully uploaded/processed files (mutable now)
+  const [uploadedFiles, setUploadedFiles] = useState<string[]>([]); 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  
+  // New states for AI generation process
+  const [isLoading, setIsLoading] = useState(false);
+  const [generatedOutput, setGeneratedOutput] = useState<GeneratedOutput | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const learningStyleInfo = {
@@ -41,6 +56,101 @@ const Dashboard = () => {
   const currentStyle = learningStyleInfo[learningStyle as keyof typeof learningStyleInfo];
   const StyleIcon = currentStyle.icon;
 
+  // Utility to read file content as text
+  const readFileAsText = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        // Limit content size to ensure API call is not excessively large
+        const content = event.target?.result as string;
+        // Simple truncation for large files as an MVP safety measure
+        resolve(content.substring(0, 50000)); 
+      };
+      reader.onerror = (error) => {
+        reject(new Error(`Failed to read file: ${file.name}`));
+      };
+      // For MVP, we only read the file as text. Real PDF/DOCX parsing is outside MVP scope.
+      reader.readAsText(file);
+    });
+  };
+
+  // Function to call the Gemini API with exponential backoff
+  const generateContentWithGemini = async (content: string, style: string): Promise<{ text: string; sources: any[] }> => {
+    let systemPrompt = "";
+    let userQuery = `Based on the following study material, create a personalized study aid for a ${style} learner. The content should focus on key concepts and actionable learning points.`;
+
+    // Adaptive Prompting Logic
+    if (style === "visual") {
+      systemPrompt = "You are an expert tutor creating a structured study guide for a visual learner. Your output MUST be formatted using markdown to emphasize visual structure: use bullet points, numbered lists, tables, and clear headings. For every main concept, suggest a simple visual representation (like a flowchart, diagram, or mind-map structure) that the learner can draw.";
+    } else if (style === "practical") {
+      systemPrompt = "You are an expert tutor creating a practical study guide focused on application for a hands-on learner. Your output MUST include at least three detailed, real-world examples or case studies that demonstrate how the core concepts are used in practice. Also, include a short practice scenario or question.";
+    } else if (style === "conceptual") {
+      systemPrompt = "You are an expert tutor creating a conceptual study guide for a learner who thrives on understanding deep theories. Your output MUST clearly define the underlying principles and explain the relationships between the main ideas, using strong analogies if possible. Explain the 'Why' behind the facts.";
+    }
+
+    userQuery += "\n\nMaterial to study:\n" + content;
+
+    const apiKey = "AIzaSyDu_ys_7SGH1FEBz7eFL6-hJiDZrRS4AeA";  
+    const model = "gemini-2.5-flash-preview-05-20";
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const payload = {
+      contents: [{ parts: [{ text: userQuery }] }],
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      // Optional: Add safety settings if needed
+    };
+
+    const MAX_RETRIES = 3;
+    let attempt = 0;
+    while (attempt < MAX_RETRIES) {
+      try {
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          throw new Error(`API call failed with status: ${response.status}`);
+        }
+
+        const result = await response.json();
+        const candidate = result.candidates?.[0];
+
+        if (candidate && candidate.content?.parts?.[0]?.text) {
+          const text = candidate.content.parts[0].text;
+          
+          let sources = [];
+          const groundingMetadata = candidate.groundingMetadata;
+          if (groundingMetadata && groundingMetadata.groundingAttributions) {
+              sources = groundingMetadata.groundingAttributions
+                  .map((attribution: any) => ({
+                      uri: attribution.web?.uri,
+                      title: attribution.web?.title,
+                  }))
+                  .filter((source: any) => source.uri && source.title);
+          }
+
+          return { text, sources };
+        } else {
+          throw new Error("Invalid response structure from Gemini API.");
+        }
+
+      } catch (error) {
+        console.error(`Attempt ${attempt + 1} failed:`, error);
+        attempt++;
+        if (attempt < MAX_RETRIES) {
+          const delay = Math.pow(2, attempt) * 1000; // Exponential backoff: 2s, 4s, 8s
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw new Error("Failed to generate content after multiple retries.");
+        }
+      }
+    }
+    // Should be unreachable due to the throw inside the loop, but for typing safety:
+    throw new Error("Failed to generate content after maximum retries.");
+  };
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files) {
@@ -52,7 +162,7 @@ const Dashboard = () => {
     }
   };
 
-  const handleCreateStudyAid = () => {
+  const handleCreateStudyAid = async () => {
     if (selectedFiles.length === 0) {
       toast({
         title: "No files selected",
@@ -62,10 +172,60 @@ const Dashboard = () => {
       return;
     }
 
-    // TODO: This needs Lovable Cloud for storage and AI processing
+    setIsLoading(true);
+    setGeneratedOutput(null); // Clear previous output
+    const file = selectedFiles[0]; // Process only the first file for MVP
+
     toast({
       title: "Creating study aid...",
-      description: `Processing ${selectedFiles.length} file(s) for ${currentStyle.title}`,
+      description: `1. Reading file: ${file.name}`,
+    });
+
+    try {
+      // 1. Read file content
+      const fileContent = await readFileAsText(file);
+      
+      toast({
+        title: "Creating study aid...",
+        description: `2. Generating personalized content for ${currentStyle.title}...`,
+      });
+
+      // 2. Call AI Generation
+      const result = await generateContentWithGemini(fileContent, learningStyle);
+
+      // 3. Update State on Success
+      setGeneratedOutput({
+        text: result.text,
+        style: currentStyle.title,
+        sources: result.sources,
+      });
+
+      setUploadedFiles(prev => [...prev, file.name]); // Add file to uploaded list
+      setSelectedFiles([]); // Clear selection
+
+      toast({
+        title: "Success!",
+        description: "Your personalized study aid is ready.",
+      });
+
+    } catch (error) {
+      console.error(error);
+      toast({
+        title: "Generation Failed",
+        description: (error as Error).message || "An unexpected error occurred during AI processing.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Placeholder function for the MVP feedback loop
+  const handleFeedback = (isHelpful: boolean) => {
+    console.log(`Feedback received: ${isHelpful ? 'Helpful' : 'Not Helpful'} for style: ${learningStyle}`);
+    toast({
+        title: "Feedback Recorded",
+        description: `Thank you! This helps us refine content for ${learningStyle} learners.`,
     });
   };
 
@@ -149,7 +309,7 @@ const Dashboard = () => {
                   <Sparkles className="w-5 h-5 text-secondary" />
                 </div>
                 <div>
-                  <p className="text-2xl font-bold">0</p>
+                  <p className="text-2xl font-bold">{uploadedFiles.length}</p> {/* Now shows actual count */}
                   <p className="text-xs text-muted-foreground">AI Outputs Generated</p>
                 </div>
               </div>
@@ -193,7 +353,7 @@ const Dashboard = () => {
               <Upload className="w-12 h-12 text-primary mx-auto mb-4" />
               <h3 className="text-lg font-semibold mb-2">Drop files here or click to browse</h3>
               <p className="text-sm text-muted-foreground mb-4">
-                Supports PDF, TXT, DOCX, and slide formats
+                Supports PDF, TXT, DOCX, and slide formats (Text content extraction assumed for MVP)
               </p>
               {selectedFiles.length > 0 && (
                 <p className="text-sm font-medium text-primary mb-4">
@@ -206,12 +366,16 @@ const Dashboard = () => {
             </div>
             <Button 
               onClick={handleCreateStudyAid}
-              disabled={selectedFiles.length === 0}
+              disabled={selectedFiles.length === 0 || isLoading}
               className="w-full mt-4"
               size="lg"
             >
-              <Sparkles className="w-5 h-5 mr-2" />
-              Create Study Aid
+              {isLoading ? (
+                <RotateCw className="w-5 h-5 mr-2 animate-spin" />
+              ) : (
+                <Sparkles className="w-5 h-5 mr-2" />
+              )}
+              {isLoading ? `Generating for ${currentStyle.title}...` : 'Create Study Aid'}
             </Button>
             {uploadedFiles.length === 0 && (
               <div className="mt-6 p-4 bg-muted/50 rounded-lg">
@@ -224,6 +388,51 @@ const Dashboard = () => {
           </CardContent>
         </Card>
 
+        {/* Study Aid Output Section (NEW) */}
+        {(isLoading || generatedOutput) && (
+          <Card className="mt-8 shadow-card border-2">
+            <CardHeader className="flex flex-row items-center justify-between">
+                <CardTitle className="text-xl flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-secondary" />
+                    AI-Generated Study Aid
+                </CardTitle>
+                {generatedOutput && (
+                  <div className={`px-3 py-1 text-sm font-medium rounded-full ${currentStyle.bg} ${currentStyle.color}`}>
+                    For {generatedOutput.style} Learners
+                  </div>
+                )}
+            </CardHeader>
+            <CardContent>
+              {isLoading && (
+                <div className="flex flex-col items-center justify-center p-12">
+                  <RotateCw className="w-8 h-8 text-primary animate-spin mb-4" />
+                  <p className="text-lg font-medium text-primary">Generating Content...</p>
+                  <p className="text-sm text-muted-foreground mt-2">
+                    This may take a moment while the AI analyzes your material and creates the personalized aid.
+                  </p>
+                </div>
+              )}
+              {generatedOutput && (
+                <div className="prose max-w-none">
+                  {/* Display the raw markdown text in a scrollable block */}
+                  <div className="whitespace-pre-wrap p-6 bg-gray-50 rounded-lg text-sm text-gray-700 border border-gray-200 shadow-inner max-h-[50vh] overflow-y-auto">
+                    {generatedOutput.text}
+                  </div>
+                  
+                  {/* Simple feedback loop MVP */}
+                  <div className="mt-6 flex items-center justify-between p-4 bg-success/10 border border-success/30 rounded-lg">
+                    <p className="font-medium text-sm text-success-foreground">Was this helpful?</p>
+                    <div className="flex gap-2">
+                      <Button variant="outline" size="sm" className="bg-white hover:bg-success/20" onClick={() => handleFeedback(true)}>👍 Yes</Button>
+                      <Button variant="outline" size="sm" className="bg-white hover:bg-destructive/20" onClick={() => handleFeedback(false)}>👎 No</Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+        
         {/* Recent Materials Section */}
         {uploadedFiles.length > 0 && (
           <div className="mt-8">
@@ -236,13 +445,13 @@ const Dashboard = () => {
                       <FileText className="w-5 h-5 text-primary" />
                       <div className="flex-1">
                         <CardTitle className="text-base">{file}</CardTitle>
-                        <CardDescription>Uploaded recently</CardDescription>
+                        <CardDescription>Generated: {new Date().toLocaleDateString()}</CardDescription>
                       </div>
                     </div>
                   </CardHeader>
                   <CardContent>
-                    <Button variant="outline" size="sm" className="w-full">
-                      View Generated Content
+                    <Button variant="outline" size="sm" className="w-full" disabled>
+                      View Generated Content (Placeholder)
                     </Button>
                   </CardContent>
                 </Card>
