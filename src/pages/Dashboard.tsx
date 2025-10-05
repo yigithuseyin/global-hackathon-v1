@@ -1,23 +1,15 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { Brain, Upload, FileText, Eye, Target, Lightbulb, Sparkles, TrendingUp, RotateCw } from "lucide-react";
+import { Brain, Upload, FileText, Eye, Target, Lightbulb, Sparkles, TrendingUp, RotateCw, CheckCircle, XCircle, ChevronRight, Zap, Trophy } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 
 // --- GLOBAL LIBRARY DEPENDENCY NOTES (CRITICAL) ---
-// For the DOCX and PDF parsing functions below to work, the following libraries
-// MUST be loaded globally via script tags in the HTML file hosting this component:
-// 
-// 1. DOCX Parsing (mammoth.js):
-//    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.5.0/mammoth.browser.min.js"></script>
-//    (This exposes the global 'mammoth' object)
-//
-// 2. PDF Parsing (pdf.js):
-//    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
-//    <script>pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';</script>
-//    (This exposes the global 'pdfjsLib' object)
+// These global objects are required for DOCX and PDF parsing:
+// 1. DOCX Parsing (mammoth.js): requires global 'mammoth' object.
+// 2. PDF Parsing (pdf.js): requires global 'pdfjsLib' object.
 // ----------------------------------------------------
 
 // Define the structure for the AI output
@@ -25,6 +17,16 @@ interface GeneratedOutput {
   text: string;
   style: string;
   sources: { uri: string; title: string }[];
+}
+
+// Define Quiz Interface
+interface QuizQuestion {
+  question: string;
+  options: string[];
+  correctAnswerIndex: number;
+  explanation_visual: string;
+  explanation_practical: string;
+  explanation_conceptual: string;
 }
 
 // Global types for assumed CDN libraries to satisfy TypeScript (needed for single-file apps)
@@ -36,20 +38,46 @@ declare const pdfjsLib: {
   GlobalWorkerOptions: { workerSrc: string };
 };
 
+// Learning Style Utility
+const learningStylesArray = ['visual', 'practical', 'conceptual'];
+
+const getNextStyle = (current: string, styles: string[]) => {
+  const currentIndex = styles.indexOf(current);
+  const nextIndex = (currentIndex + 1) % styles.length;
+  return styles[nextIndex];
+};
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
-  // Retrieve learning style, default to 'visual'
-  const learningStyle = localStorage.getItem("learningStyle") || "visual";
   
+  // State for tracking and updating the current learning style dynamically
+  const [currentLearningStyle, setCurrentLearningStyle] = useState(
+    localStorage.getItem("learningStyle") || "visual"
+  );
+  
+  // NEW: State for tracking the profile confidence score
+  const [profileConfidence, setProfileConfidence] = useState(85); // Initial confidence is 85%
+
   // State for tracking successfully uploaded/processed files
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]); 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   
-  // New states for AI generation process
+  // States for AI generation process
   const [isLoading, setIsLoading] = useState(false);
   const [generatedOutput, setGeneratedOutput] = useState<GeneratedOutput | null>(null);
+
+  // States for Quiz feature
+  const [quizQuestions, setQuizQuestions] = useState<QuizQuestion[] | null>(null); // Array of 5 questions
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0); // Which question is active
+  const currentQuiz = quizQuestions ? quizQuestions[currentQuestionIndex] : null; // The active question
+  
+  const [quizStatus, setQuizStatus] = useState<'waiting' | 'correct' | 'incorrect' | 'unanswered' | 'completed'>('unanswered');
+  const [userSelection, setUserSelection] = useState<number | null>(null);
+  const [incorrectCount, setIncorrectCount] = useState(0);
+  const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false);
+  const [quizScore, setQuizScore] = useState(0);
+
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -60,6 +88,7 @@ const Dashboard = () => {
       description: "You learn best through diagrams, charts, and visual representations",
       color: "text-primary",
       bg: "bg-primary/10",
+      explanationKey: 'explanation_visual' as const,
     },
     practical: {
       icon: Target,
@@ -67,6 +96,7 @@ const Dashboard = () => {
       description: "You excel with real-world examples and hands-on practice",
       color: "text-secondary",
       bg: "bg-secondary/10",
+      explanationKey: 'explanation_practical' as const,
     },
     conceptual: {
       icon: Lightbulb,
@@ -74,10 +104,11 @@ const Dashboard = () => {
       description: "You thrive on understanding theories and underlying principles",
       color: "text-accent",
       bg: "bg-accent/10",
+      explanationKey: 'explanation_conceptual' as const,
     },
   };
 
-  const currentStyle = learningStyleInfo[learningStyle as keyof typeof learningStyleInfo];
+  const currentStyle = learningStyleInfo[currentLearningStyle as keyof typeof learningStyleInfo];
   const StyleIcon = currentStyle.icon;
 
   // Utility to read file as ArrayBuffer, necessary for binary file parsing
@@ -94,7 +125,7 @@ const Dashboard = () => {
     });
   };
 
-  // --- NEW: DOCX Parsing Function (Relies on global 'mammoth' object) ---
+  // --- DOCX and PDF Parsing Functions ---
   const parseDocx = async (file: File): Promise<string> => {
     if (typeof mammoth === 'undefined') {
       throw new Error("DOCX parser (mammoth.js) is not loaded. Check the CDN script tag in your HTML.");
@@ -104,7 +135,6 @@ const Dashboard = () => {
     return result.value;
   };
 
-  // --- NEW: PDF Parsing Function (Relies on global 'pdfjsLib' object) ---
   const parsePdf = async (file: File): Promise<string> => {
     if (typeof pdfjsLib === 'undefined') {
       throw new Error("PDF parser (pdf.js) is not loaded. Check the CDN script tags in your HTML.");
@@ -113,23 +143,20 @@ const Dashboard = () => {
     const arrayBuffer = await readFileAsArrayBuffer(file);
     const data = new Uint8Array(arrayBuffer);
     
-    // Asynchronously load the PDF document
     const pdf = await pdfjsLib.getDocument({ data }).promise;
 
     let fullText = '';
-    // Loop through all pages and extract text
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
       const textContent = await page.getTextContent();
       
-      // Extract text items and join them, adding a newline between pages
       const pageText = textContent.items.map((item: any) => item.str).join(' ');
       fullText += pageText + '\n';
     }
     return fullText;
   };
   
-  // Utility to read file content as text (now supports TXT, DOCX, PDF)
+  // Utility to read file content as text (supports TXT, DOCX, PDF)
   const readFileAsText = async (file: File): Promise<string> => {
     const fileName = file.name.toLowerCase();
     const isTxt = fileName.endsWith('.txt');
@@ -138,13 +165,12 @@ const Dashboard = () => {
 
     let content: string;
     
-    // --- Handling Plain Text (.txt) ---
+    // Handling Plain Text (.txt)
     if (isTxt) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (event) => {
           content = event.target?.result as string;
-          // Simple truncation for large files as an MVP safety measure
           resolve(content.substring(0, 50000)); 
         };
         reader.onerror = (error) => {
@@ -154,14 +180,13 @@ const Dashboard = () => {
       });
     }
     
-    // --- Handling Binary Files (.docx, .pdf) ---
+    // Handling Binary Files (.docx, .pdf)
     try {
       if (isDocx) {
         content = await parseDocx(file);
       } else if (isPdf) {
         content = await parsePdf(file);
       } else {
-        // --- Handling Other Unsupported Files ---
         throw new Error(`Unsupported file type: ${file.name}. Only .txt, .docx, and .pdf are supported.`);
       }
 
@@ -169,17 +194,44 @@ const Dashboard = () => {
       return content.substring(0, 50000);
       
     } catch (error) {
-      // Re-throw the specific error from the parser
       throw error; 
     }
   };
 
-  // Function to call the Gemini API with exponential backoff
+  // --- API Utility with Exponential Backoff ---
+  const fetchApiWithBackoff = async (apiUrl: string, payload: any, maxRetries = 3) => {
+    let attempt = 0;
+    while (attempt < maxRetries) {
+      try {
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          throw new Error(`API call failed with status: ${response.status}`);
+        }
+        return response.json();
+      } catch (error) {
+        console.error(`Attempt ${attempt + 1} failed:`, error);
+        attempt++;
+        if (attempt < maxRetries) {
+          const delay = Math.pow(2, attempt) * 1000; 
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw new Error("Failed to communicate with Gemini API after multiple retries.");
+        }
+      }
+    }
+  };
+
+  // --- Function to generate the STUDY AID content ---
   const generateContentWithGemini = async (content: string, style: string): Promise<{ text: string; sources: any[] }> => {
     let systemPrompt = "";
     let userQuery = `Based on the following study material, create a personalized study aid for a ${style} learner. The content should focus on key concepts and actionable learning points.`;
 
-    // Adaptive Prompting Logic
+    // Adaptive Prompting Logic for Study Aid
     if (style === "visual") {
       systemPrompt = "You are an expert tutor creating a structured study guide for a visual learner. Your output MUST be formatted using markdown to emphasize visual structure: use bullet points, numbered lists, tables, and clear headings. For every main concept, suggest a simple visual representation (like a flowchart, diagram, or mind-map structure) that the learner can draw.";
     } else if (style === "practical") {
@@ -190,8 +242,7 @@ const Dashboard = () => {
 
     userQuery += "\n\nMaterial to study:\n" + content;
 
-    // --- API Key Handling ---
-    const apiKey = "AIzaSyAilDoFYsZpPd1lZmSsIYR6pE-M3WnNnp8"; // The environment automatically injects the secure API key
+    const apiKey = "";
     const model = "gemini-2.5-flash-preview-05-20";
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
@@ -200,59 +251,95 @@ const Dashboard = () => {
       systemInstruction: { parts: [{ text: systemPrompt }] },
     };
 
-    const MAX_RETRIES = 3;
-    let attempt = 0;
-    while (attempt < MAX_RETRIES) {
-      try {
-        const response = await fetch(apiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+    const result = await fetchApiWithBackoff(apiUrl, payload);
+    const candidate = result.candidates?.[0];
 
-        if (!response.ok) {
-          // If response fails, throw error to trigger retry or final catch
-          throw new Error(`API call failed with status: ${response.status}`);
+    if (candidate && candidate.content?.parts?.[0]?.text) {
+        const text = candidate.content.parts[0].text;
+        
+        let sources = [];
+        const groundingMetadata = candidate.groundingMetadata;
+        if (groundingMetadata && groundingMetadata.groundingAttributions) {
+            sources = groundingMetadata.groundingAttributions
+                .map((attribution: any) => ({
+                    uri: attribution.web?.uri,
+                    title: attribution.web?.title,
+                }))
+                .filter((source: any) => source.uri && source.title);
         }
 
-        const result = await response.json();
-        const candidate = result.candidates?.[0];
-
-        if (candidate && candidate.content?.parts?.[0]?.text) {
-          const text = candidate.content.parts[0].text;
-          
-          let sources = [];
-          const groundingMetadata = candidate.groundingMetadata;
-          if (groundingMetadata && groundingMetadata.groundingAttributions) {
-              sources = groundingMetadata.groundingAttributions
-                  .map((attribution: any) => ({
-                      uri: attribution.web?.uri,
-                      title: attribution.web?.title,
-                  }))
-                  .filter((source: any) => source.uri && source.title);
-          }
-
-          return { text, sources };
-        } else {
-          throw new Error("Invalid response structure from Gemini API.");
-        }
-
-      } catch (error) {
-        console.error(`Attempt ${attempt + 1} failed:`, error);
-        attempt++;
-        if (attempt < MAX_RETRIES) {
-          // Exponential backoff: 2s, 4s, 8s delay before next attempt
-          const delay = Math.pow(2, attempt) * 1000; 
-          await new Promise(resolve => setTimeout(resolve, delay));
-        } else {
-          // Final failure after all retries
-          throw new Error("Failed to generate content after multiple retries.");
-        }
-      }
+        return { text, sources };
+    } else {
+        throw new Error("Invalid response structure for study aid from Gemini API.");
     }
-    // Fallback if the loop somehow completes without returning or throwing
-    throw new Error("Failed to generate content.");
   };
+
+
+  // --- Function to generate the QUIZ content (Structured JSON, requesting 5 questions) ---
+  const generateQuizWithGemini = async (context: string): Promise<QuizQuestion[]> => {
+    const systemPrompt = `You are a quiz master. Your task is to generate five unique multiple-choice questions (4 options each) based on the provided text context. 
+    For each question, you MUST provide explanations for the correct answer tailored to three specific learning styles: visual, practical, and conceptual. 
+    The output MUST be a valid JSON array matching the provided schema. Each question must be challenging but directly answerable from the context.`;
+
+    const userQuery = `Generate 5 quiz questions and the required explanations based on this material: \n\n${context}`;
+
+    // JSON Schema for structured output (Now an ARRAY of QuizQuestion objects)
+    const responseSchema = {
+        type: "ARRAY",
+        items: {
+            type: "OBJECT",
+            properties: {
+                "question": { "type": "STRING" },
+                "options": { 
+                    "type": "ARRAY",
+                    "items": { "type": "STRING" },
+                    "description": "Exactly four multiple-choice options."
+                },
+                "correctAnswerIndex": { 
+                    "type": "INTEGER", 
+                    "description": "The 0-based index of the correct option (0, 1, 2, or 3)." 
+                },
+                "explanation_visual": { "type": "STRING" },
+                "explanation_practical": { "type": "STRING" },
+                "explanation_conceptual": { "type": "STRING" }
+            },
+            "required": ["question", "options", "correctAnswerIndex", "explanation_visual", "explanation_practical", "explanation_conceptual"],
+            "propertyOrdering": ["question", "options", "correctAnswerIndex", "explanation_visual", "explanation_practical", "explanation_conceptual"]
+        }
+    };
+
+    const apiKey = ""; 
+    const model = "gemini-2.5-flash-preview-05-20";
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const payload = {
+        contents: [{ parts: [{ text: userQuery }] }],
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: responseSchema
+        }
+    };
+    
+    const result = await fetchApiWithBackoff(apiUrl, payload);
+
+    try {
+        const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!jsonText) throw new Error("JSON response text is empty.");
+        const parsedJson = JSON.parse(jsonText);
+        
+        // Basic validation: Check if it's an array and has at least one question
+        if (!Array.isArray(parsedJson) || parsedJson.length === 0) {
+            throw new Error("Parsed quiz structure is invalid: Expected an array of questions.");
+        }
+
+        return parsedJson as QuizQuestion[];
+    } catch (e) {
+        console.error("Failed to parse quiz JSON:", e);
+        throw new Error("Could not parse valid quiz data from AI response.");
+    }
+  };
+
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -277,6 +364,12 @@ const Dashboard = () => {
 
     setIsLoading(true);
     setGeneratedOutput(null); // Clear previous output
+    setQuizQuestions(null); // Clear previous quiz
+    setQuizScore(0);
+    setCurrentQuestionIndex(0);
+    setQuizStatus('unanswered');
+    setIncorrectCount(0);
+
     const file = selectedFiles[0]; // Process only the first file for MVP
 
     toast({
@@ -285,7 +378,7 @@ const Dashboard = () => {
     });
 
     try {
-      // 1. Read file content (uses the refactored, multi-format utility)
+      // 1. Read file content 
       const fileContent = await readFileAsText(file);
       
       toast({
@@ -293,8 +386,8 @@ const Dashboard = () => {
         description: `2. Generating personalized content for ${currentStyle.title}...`,
       });
 
-      // 2. Call AI Generation
-      const result = await generateContentWithGemini(fileContent, learningStyle);
+      // 2. Call AI Generation for Study Aid
+      const result = await generateContentWithGemini(fileContent, currentLearningStyle);
 
       // 3. Update State on Success
       setGeneratedOutput({
@@ -309,14 +402,13 @@ const Dashboard = () => {
 
       toast({
         title: "Success!",
-        description: "Your personalized study aid is ready.",
+        description: "Your personalized study aid is ready. Scroll down to take the quiz!",
       });
 
     } catch (error) {
       console.error(error);
       toast({
         title: "Generation Failed",
-        // Display the specific error message, including potential missing library errors
         description: (error as Error).message || "An unexpected error occurred during AI processing.",
         variant: "destructive",
       });
@@ -324,13 +416,127 @@ const Dashboard = () => {
       setIsLoading(false);
     }
   };
+  
+  // --- QUIZ LOGIC FUNCTIONS ---
+  
+  const fetchNewQuizQuestionSet = async () => {
+    if (!generatedOutput?.text) {
+        toast({ title: "Error", description: "Please generate a study aid first to create a quiz.", variant: "destructive" });
+        return;
+    }
+
+    setIsGeneratingQuiz(true);
+    setQuizQuestions(null);
+    setCurrentQuestionIndex(0);
+    setQuizStatus('unanswered');
+    setIncorrectCount(0);
+    setQuizScore(0);
+
+    try {
+        toast({ title: "Generating Quiz Set...", description: "AI is crafting 5 new questions..." });
+        const newQuizSet = await generateQuizWithGemini(generatedOutput.text);
+        setQuizQuestions(newQuizSet);
+        toast({ title: "Quiz Ready!", description: "Start the 5-question personalized quiz." });
+    } catch (error) {
+        console.error("Quiz generation error:", error);
+        toast({ title: "Quiz Failed", description: "Could not generate quiz data. " + (error as Error).message, variant: "destructive" });
+    } finally {
+        setIsGeneratingQuiz(false);
+  }
+  };
+  
+  // Renders the correct explanation based on the quiz status and the current learning style
+  const getExplanationText = useMemo(() => {
+    if (!currentQuiz || quizStatus !== 'incorrect') return null;
+
+    let styleToExplain = currentLearningStyle;
+
+    // Adaptive switch logic: If 3 consecutive incorrect answers, switch style for explanation.
+    if (incorrectCount >= 3) {
+        styleToExplain = getNextStyle(currentLearningStyle, learningStylesArray);
+    }
+
+    const explanationKey = learningStyleInfo[styleToExplain as keyof typeof learningStyleInfo].explanationKey;
+    const explanation = currentQuiz[explanationKey];
+    const explanationStyle = learningStyleInfo[styleToExplain as keyof typeof learningStyleInfo].title;
+
+    return { explanation, explanationStyle, newStyle: styleToExplain };
+  }, [currentQuiz, quizStatus, incorrectCount, currentLearningStyle]);
+
+
+  // Function to handle user clicking an answer option
+  const handleAnswerSubmit = (selectedIndex: number) => {
+    if (quizStatus !== 'unanswered' || isGeneratingQuiz || !currentQuiz) return;
+
+    setUserSelection(selectedIndex);
+
+    if (selectedIndex === currentQuiz.correctAnswerIndex) {
+        setQuizStatus('correct');
+        setIncorrectCount(0); // Reset incorrect count on success
+        setQuizScore(prev => prev + 1); // Increment score
+        // NEW: Increase confidence by 1% on correct answer (max 100)
+        setProfileConfidence(prev => Math.min(100, prev + 1)); 
+        toast({ title: "Correct!", description: "Great job! Click Next Question to continue." });
+    } else {
+        setQuizStatus('incorrect');
+        setIncorrectCount(prev => prev + 1);
+        toast({ title: "Incorrect.", description: "Review the explanation below.", variant: "destructive" });
+    }
+  };
+
+  // Function to handle moving to the next question, including style switching logic
+  const handleNextQuestion = async () => {
+    if (!currentQuiz || !quizQuestions) return;
+    
+    // 1. Check for end of quiz
+    if (currentQuestionIndex >= quizQuestions.length - 1) {
+        setQuizStatus('completed');
+        return; // Quiz finished
+    }
+
+    // 2. Check if we need to switch style due to persistent mistakes
+    if (quizStatus === 'incorrect' && incorrectCount >= 3) {
+        const nextStyle = getNextStyle(currentLearningStyle, learningStylesArray);
+        
+        // Update localStorage and component state to the new, potentially more effective style
+        localStorage.setItem("learningStyle", nextStyle);
+        setCurrentLearningStyle(nextStyle);
+        
+        // NEW: Decrease confidence by 25% on style switch (min 0)
+        setProfileConfidence(prev => Math.max(0, prev - 25));
+        
+        toast({ 
+            title: "Adaptive Change!", 
+            description: `The quiz detected difficulty. Switching your profile to the ${learningStyleInfo[nextStyle as keyof typeof learningStyleInfo].title} profile for better comprehension. (Confidence -25%)`,
+            variant: "default"
+        });
+        
+        setIncorrectCount(0); // Reset incorrect count after switching
+    }
+
+    // 3. Move to the next question
+    setCurrentQuestionIndex(prev => prev + 1);
+    setQuizStatus('unanswered');
+    setUserSelection(null);
+  };
+
+  const handleRetakeQuiz = () => {
+    setQuizScore(0);
+    setCurrentQuestionIndex(0);
+    setQuizStatus('unanswered');
+    setIncorrectCount(0);
+    setUserSelection(null);
+  };
+  
+  // --- END QUIZ LOGIC FUNCTIONS ---
+
 
   // Placeholder function for the MVP feedback loop
   const handleFeedback = (isHelpful: boolean) => {
-    console.log(`Feedback received: ${isHelpful ? 'Helpful' : 'Not Helpful'} for style: ${learningStyle}`);
+    console.log(`Feedback received: ${isHelpful ? 'Helpful' : 'Not Helpful'} for style: ${currentLearningStyle}`);
     toast({
         title: "Feedback Recorded",
-        description: `Thank you! This helps us refine content for ${learningStyle} learners.`,
+        description: `Thank you! This helps us refine content for ${currentLearningStyle} learners.`,
     });
   };
 
@@ -379,13 +585,15 @@ const Dashboard = () => {
                 <div>
                   <div className="flex justify-between text-sm mb-2">
                     <span className="text-muted-foreground">Profile Confidence</span>
-                    <span className="font-medium">85%</span>
+                    {/* UPDATED: Use dynamic profileConfidence state */}
+                    <span className="font-medium">{profileConfidence}%</span> 
                   </div>
-                  <Progress value={85} className="h-2" />
+                  {/* UPDATED: Use dynamic profileConfidence state */}
+                  <Progress value={profileConfidence} className="h-2" /> 
                 </div>
                 <p className="text-sm text-muted-foreground">
                   As you use LearnMate, we'll continue refining your learning profile based on
-                  what works best for you.
+                  what works best for you. Confidence decreases when the style needs adjustment and increases with correct answers!
                 </p>
                 <Button variant="outline" onClick={() => navigate("/onboarding")}>
                   Retake Assessment
@@ -495,7 +703,7 @@ const Dashboard = () => {
           </CardContent>
         </Card>
 
-        {/* Study Aid Output Section (NEW) */}
+        {/* Study Aid Output Section */}
         {(isLoading || generatedOutput) && (
           <Card className="mt-8 shadow-card border-2">
             <CardHeader className="flex flex-row items-center justify-between">
@@ -505,7 +713,7 @@ const Dashboard = () => {
                 </CardTitle>
                 {generatedOutput && (
                   <div className={`px-3 py-1 text-sm font-medium rounded-full ${currentStyle.bg} ${currentStyle.color}`}>
-                    For {generatedOutput.style} Learners
+                    For {currentStyle.title}
                   </div>
                 )}
             </CardHeader>
@@ -526,14 +734,188 @@ const Dashboard = () => {
                     {generatedOutput.text}
                   </div>
                   
+                  {/* Action button to start the quiz */}
+                  <div className="mt-6">
+                    <Button 
+                      onClick={fetchNewQuizQuestionSet} 
+                      disabled={isGeneratingQuiz || quizQuestions !== null} 
+                      className="w-full bg-indigo-600 hover:bg-indigo-700"
+                      size="lg"
+                    >
+                      {isGeneratingQuiz ? (
+                        <RotateCw className="w-5 h-5 mr-2 animate-spin" />
+                      ) : (
+                        <Zap className="w-5 h-5 mr-2" />
+                      )}
+                      {quizQuestions === null ? (
+                          isGeneratingQuiz ? 'Generating 5 Questions...' : 'Start Personalized Quiz (5 Questions)'
+                      ) : (
+                          'Quiz Set Ready'
+                      )}
+                    </Button>
+                  </div>
+
                   {/* Simple feedback loop MVP */}
                   <div className="mt-6 flex items-center justify-between p-4 bg-success/10 border border-success/30 rounded-lg">
-                    <p className="font-medium text-sm text-success-foreground">Was this helpful?</p>
+                    <p className="font-medium text-sm text-success-foreground">Was this study aid helpful?</p>
                     <div className="flex gap-2">
                       <Button variant="outline" size="sm" className="bg-white hover:bg-success/20" onClick={() => handleFeedback(true)}>👍 Yes</Button>
                       <Button variant="outline" size="sm" className="bg-white hover:bg-destructive/20" onClick={() => handleFeedback(false)}>👎 No</Button>
                     </div>
                   </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+        
+        {/* --- QUIZ SECTION (NEW) --- */}
+        {quizQuestions && (
+          <Card className="mt-8 shadow-glow border-2 border-indigo-400">
+            <CardHeader>
+              <CardTitle className="text-2xl flex items-center gap-2 text-indigo-700">
+                <Zap className="w-6 h-6" />
+                Personalized Quiz
+              </CardTitle>
+              <CardDescription>
+                Question {currentQuestionIndex + 1} of {quizQuestions.length}. Score: {quizScore}/{quizQuestions.length}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {quizStatus !== 'completed' && currentQuiz ? (
+                <>
+                  {/* Quiz Question */}
+                  <div className="mb-6 p-4 rounded-lg bg-indigo-50 border border-indigo-200">
+                    <p className="text-lg font-semibold text-indigo-800 mb-3">
+                      Q: {currentQuiz.question}
+                    </p>
+                  </div>
+
+                  {/* Quiz Options - IMPROVED STYLING */}
+                  <div className="space-y-3">
+                    {currentQuiz.options.map((option, index) => {
+                      
+                      // Determine button style based on status
+                      let buttonClass = "w-full justify-start transition-colors duration-150 text-left h-auto py-3 px-4";
+                      let disabled = quizStatus !== 'unanswered';
+
+                      if (quizStatus !== 'unanswered') {
+                        // Answer is submitted/checked
+                        if (index === currentQuiz.correctAnswerIndex) {
+                          buttonClass += " bg-green-100 border-2 border-green-600 text-green-800 font-bold hover:bg-green-100";
+                        } else if (index === userSelection) {
+                          buttonClass += " bg-red-100 border-2 border-red-600 text-red-800 font-bold hover:bg-red-100";
+                        } else {
+                          buttonClass += " bg-gray-100 text-gray-500 border border-gray-200";
+                        }
+                      } else {
+                        // Answer is unanswered
+                        buttonClass += " bg-white hover:bg-indigo-50 border border-indigo-200";
+                        if (index === userSelection) {
+                             buttonClass += " border-2 border-indigo-500 ring-4 ring-indigo-200";
+                        }
+                      }
+                      
+                      return (
+                        <Button
+                          key={index}
+                          variant="outline"
+                          // Added flex-col and flex-1 for responsive wrapping and alignment
+                          className={`${buttonClass} flex flex-col items-start`}
+                          onClick={() => handleAnswerSubmit(index)}
+                          disabled={disabled}
+                        >
+                          <span className="font-mono text-sm mr-3">
+                            {String.fromCharCode(65 + index)}.
+                          </span>
+                          <span className="flex-1 whitespace-normal text-wrap">
+                            {option}
+                          </span>
+                        </Button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Status & Explanation */}
+                  {quizStatus !== 'unanswered' && (
+                    <div className="mt-6 p-4 rounded-lg border-2" 
+                        style={{ 
+                            borderColor: quizStatus === 'correct' ? '#10B981' : '#F59E0B', 
+                            backgroundColor: quizStatus === 'correct' ? '#ECFDF5' : '#FFFBEB' 
+                        }}>
+                        
+                        <div className="flex items-center mb-3">
+                          {quizStatus === 'correct' ? (
+                            <CheckCircle className="w-6 h-6 text-green-500 mr-2" />
+                          ) : (
+                            <XCircle className="w-6 h-6 text-yellow-600 mr-2" />
+                          )}
+                          <p className={`font-bold ${quizStatus === 'correct' ? 'text-green-600' : 'text-yellow-700'}`}>
+                            {quizStatus === 'correct' ? 'Correct!' : 'Incorrect.'}
+                            {quizStatus === 'incorrect' && incorrectCount < 3 && (
+                              <span className="ml-2 font-normal text-sm text-gray-600">
+                                (Mistake {incorrectCount} of 3 in a row)
+                              </span>
+                            )}
+                            {quizStatus === 'incorrect' && incorrectCount >= 3 && (
+                              <span className="ml-2 font-normal text-sm text-red-600">
+                                (Adaptive Learning: Explanation switching to {getExplanationText?.explanationStyle})
+                              </span>
+                            )}
+                          </p>
+                        </div>
+
+                        {quizStatus === 'incorrect' && getExplanationText && (
+                            <div className="mt-4 p-3 bg-white border rounded-md">
+                                <p className="font-semibold text-sm mb-2 text-gray-700">
+                                    Explanation ({getExplanationText.explanationStyle}):
+                                </p>
+                                <p className="text-sm whitespace-pre-wrap">
+                                    {getExplanationText.explanation}
+                                </p>
+                            </div>
+                        )}
+                        
+                        {/* Next Button */}
+                        <div className="mt-4">
+                            <Button 
+                                onClick={handleNextQuestion} 
+                                disabled={isGeneratingQuiz}
+                                className="w-full bg-indigo-600 hover:bg-indigo-700"
+                            >
+                                {isGeneratingQuiz ? (
+                                    <RotateCw className="w-5 h-5 mr-2 animate-spin" />
+                                ) : (
+                                    <>
+                                        {currentQuestionIndex < quizQuestions.length - 1 ? 'Next Question' : 'Finish Quiz'}
+                                        <ChevronRight className="w-5 h-5 ml-2" />
+                                    </>
+                                )}
+                            </Button>
+                        </div>
+                    </div>
+                  )}
+                  {incorrectCount > 0 && quizStatus === 'unanswered' && (
+                    <div className="px-6 pb-4 text-xs text-center text-red-500">
+                        You have {incorrectCount} consecutive incorrect answers. Get 3 in a row to switch learning styles.
+                    </div>
+                  )}
+                </>
+              ) : (
+                // Quiz Completed State
+                <div className="text-center p-10 space-y-4 bg-indigo-50 rounded-lg border border-indigo-200">
+                    <Trophy className="w-12 h-12 text-yellow-500 mx-auto" />
+                    <h3 className="text-2xl font-bold text-indigo-700">Quiz Completed!</h3>
+                    <p className="text-xl">
+                        Your Final Score: <span className="font-extrabold text-green-600">{quizScore}/{quizQuestions.length}</span>
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                        Your final profile confidence is <span className="font-bold text-primary">{profileConfidence}%</span>. Keep practicing or upload new material to continue your adaptive learning journey.
+                    </p>
+                    <div className="flex justify-center gap-4 pt-2">
+                        <Button onClick={handleRetakeQuiz} variant="secondary">Retake Quiz</Button>
+                        <Button onClick={fetchNewQuizQuestionSet}>Generate New Quiz</Button>
+                    </div>
                 </div>
               )}
             </CardContent>
