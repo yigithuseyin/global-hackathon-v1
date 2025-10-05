@@ -6,6 +6,20 @@ import { Brain, Upload, FileText, Eye, Target, Lightbulb, Sparkles, TrendingUp, 
 import { useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 
+// --- GLOBAL LIBRARY DEPENDENCY NOTES (CRITICAL) ---
+// For the DOCX and PDF parsing functions below to work, the following libraries
+// MUST be loaded globally via script tags in the HTML file hosting this component:
+// 
+// 1. DOCX Parsing (mammoth.js):
+//    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.5.0/mammoth.browser.min.js"></script>
+//    (This exposes the global 'mammoth' object)
+//
+// 2. PDF Parsing (pdf.js):
+//    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+//    <script>pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';</script>
+//    (This exposes the global 'pdfjsLib' object)
+// ----------------------------------------------------
+
 // Define the structure for the AI output
 interface GeneratedOutput {
   text: string;
@@ -13,13 +27,23 @@ interface GeneratedOutput {
   sources: { uri: string; title: string }[];
 }
 
+// Global types for assumed CDN libraries to satisfy TypeScript (needed for single-file apps)
+declare const mammoth: {
+  extractRawText: (options: { arrayBuffer: ArrayBuffer }) => Promise<{ value: string }>;
+};
+declare const pdfjsLib: {
+  getDocument: (options: { data: Uint8Array }) => { promise: Promise<any> };
+  GlobalWorkerOptions: { workerSrc: string };
+};
+
+
 const Dashboard = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
   // Retrieve learning style, default to 'visual'
   const learningStyle = localStorage.getItem("learningStyle") || "visual";
   
-  // State for tracking successfully uploaded/processed files (mutable now)
+  // State for tracking successfully uploaded/processed files
   const [uploadedFiles, setUploadedFiles] = useState<string[]>([]); 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   
@@ -56,22 +80,98 @@ const Dashboard = () => {
   const currentStyle = learningStyleInfo[learningStyle as keyof typeof learningStyleInfo];
   const StyleIcon = currentStyle.icon;
 
-  // Utility to read file content as text
-  const readFileAsText = (file: File): Promise<string> => {
+  // Utility to read file as ArrayBuffer, necessary for binary file parsing
+  const readFileAsArrayBuffer = (file: File): Promise<ArrayBuffer> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = (event) => {
-        // Limit content size to ensure API call is not excessively large
-        const content = event.target?.result as string;
-        // Simple truncation for large files as an MVP safety measure
-        resolve(content.substring(0, 50000)); 
+        resolve(event.target?.result as ArrayBuffer);
       };
       reader.onerror = (error) => {
-        reject(new Error(`Failed to read file: ${file.name}`));
+        reject(new Error(`Failed to read file as ArrayBuffer: ${file.name}`));
       };
-      // For MVP, we only read the file as text. Real PDF/DOCX parsing is outside MVP scope.
-      reader.readAsText(file);
+      reader.readAsArrayBuffer(file);
     });
+  };
+
+  // --- NEW: DOCX Parsing Function (Relies on global 'mammoth' object) ---
+  const parseDocx = async (file: File): Promise<string> => {
+    if (typeof mammoth === 'undefined') {
+      throw new Error("DOCX parser (mammoth.js) is not loaded. Check the CDN script tag in your HTML.");
+    }
+    const arrayBuffer = await readFileAsArrayBuffer(file);
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    return result.value;
+  };
+
+  // --- NEW: PDF Parsing Function (Relies on global 'pdfjsLib' object) ---
+  const parsePdf = async (file: File): Promise<string> => {
+    if (typeof pdfjsLib === 'undefined') {
+      throw new Error("PDF parser (pdf.js) is not loaded. Check the CDN script tags in your HTML.");
+    }
+
+    const arrayBuffer = await readFileAsArrayBuffer(file);
+    const data = new Uint8Array(arrayBuffer);
+    
+    // Asynchronously load the PDF document
+    const pdf = await pdfjsLib.getDocument({ data }).promise;
+
+    let fullText = '';
+    // Loop through all pages and extract text
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      
+      // Extract text items and join them, adding a newline between pages
+      const pageText = textContent.items.map((item: any) => item.str).join(' ');
+      fullText += pageText + '\n';
+    }
+    return fullText;
+  };
+  
+  // Utility to read file content as text (now supports TXT, DOCX, PDF)
+  const readFileAsText = async (file: File): Promise<string> => {
+    const fileName = file.name.toLowerCase();
+    const isTxt = fileName.endsWith('.txt');
+    const isDocx = fileName.endsWith('.docx') || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    const isPdf = fileName.endsWith('.pdf') || file.type === 'application/pdf';
+
+    let content: string;
+    
+    // --- Handling Plain Text (.txt) ---
+    if (isTxt) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          content = event.target?.result as string;
+          // Simple truncation for large files as an MVP safety measure
+          resolve(content.substring(0, 50000)); 
+        };
+        reader.onerror = (error) => {
+          reject(new Error(`Failed to read TXT file: ${file.name}`));
+        };
+        reader.readAsText(file);
+      });
+    }
+    
+    // --- Handling Binary Files (.docx, .pdf) ---
+    try {
+      if (isDocx) {
+        content = await parseDocx(file);
+      } else if (isPdf) {
+        content = await parsePdf(file);
+      } else {
+        // --- Handling Other Unsupported Files ---
+        throw new Error(`Unsupported file type: ${file.name}. Only .txt, .docx, and .pdf are supported.`);
+      }
+
+      // Apply truncation and resolve for DOCX/PDF
+      return content.substring(0, 50000);
+      
+    } catch (error) {
+      // Re-throw the specific error from the parser
+      throw error; 
+    }
   };
 
   // Function to call the Gemini API with exponential backoff
@@ -90,14 +190,14 @@ const Dashboard = () => {
 
     userQuery += "\n\nMaterial to study:\n" + content;
 
-    const apiKey = "API_KEY_HERE"; // Replace with your actual API key
+    // --- API Key Handling ---
+    const apiKey = "AIzaSyAilDoFYsZpPd1lZmSsIYR6pE-M3WnNnp8"; // The environment automatically injects the secure API key
     const model = "gemini-2.5-flash-preview-05-20";
     const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
     const payload = {
       contents: [{ parts: [{ text: userQuery }] }],
       systemInstruction: { parts: [{ text: systemPrompt }] },
-      // Optional: Add safety settings if needed
     };
 
     const MAX_RETRIES = 3;
@@ -111,6 +211,7 @@ const Dashboard = () => {
         });
 
         if (!response.ok) {
+          // If response fails, throw error to trigger retry or final catch
           throw new Error(`API call failed with status: ${response.status}`);
         }
 
@@ -140,15 +241,17 @@ const Dashboard = () => {
         console.error(`Attempt ${attempt + 1} failed:`, error);
         attempt++;
         if (attempt < MAX_RETRIES) {
-          const delay = Math.pow(2, attempt) * 1000; // Exponential backoff: 2s, 4s, 8s
+          // Exponential backoff: 2s, 4s, 8s delay before next attempt
+          const delay = Math.pow(2, attempt) * 1000; 
           await new Promise(resolve => setTimeout(resolve, delay));
         } else {
+          // Final failure after all retries
           throw new Error("Failed to generate content after multiple retries.");
         }
       }
     }
-    // Should be unreachable due to the throw inside the loop, but for typing safety:
-    throw new Error("Failed to generate content after maximum retries.");
+    // Fallback if the loop somehow completes without returning or throwing
+    throw new Error("Failed to generate content.");
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -182,7 +285,7 @@ const Dashboard = () => {
     });
 
     try {
-      // 1. Read file content
+      // 1. Read file content (uses the refactored, multi-format utility)
       const fileContent = await readFileAsText(file);
       
       toast({
@@ -200,8 +303,9 @@ const Dashboard = () => {
         sources: result.sources,
       });
 
-      setUploadedFiles(prev => [...prev, file.name]); // Add file to uploaded list
-      setSelectedFiles([]); // Clear selection
+      // Update file state and clear selection
+      setUploadedFiles(prev => [...prev, file.name]); 
+      setSelectedFiles([]); 
 
       toast({
         title: "Success!",
@@ -212,6 +316,7 @@ const Dashboard = () => {
       console.error(error);
       toast({
         title: "Generation Failed",
+        // Display the specific error message, including potential missing library errors
         description: (error as Error).message || "An unexpected error occurred during AI processing.",
         variant: "destructive",
       });
@@ -309,7 +414,8 @@ const Dashboard = () => {
                   <Sparkles className="w-5 h-5 text-secondary" />
                 </div>
                 <div>
-                  <p className="text-2xl font-bold">{uploadedFiles.length}</p> {/* Now shows actual count */}
+                  {/* Shows count based on successful generations */}
+                  <p className="text-2xl font-bold">{generatedOutput ? uploadedFiles.length : 0}</p> 
                   <p className="text-xs text-muted-foreground">AI Outputs Generated</p>
                 </div>
               </div>
@@ -342,7 +448,8 @@ const Dashboard = () => {
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".pdf,.txt,.docx,.pptx"
+              // Now officially accepts .pdf and .docx
+              accept=".pdf,.txt,.docx"
               onChange={handleFileSelect}
               className="hidden"
             />
@@ -353,7 +460,7 @@ const Dashboard = () => {
               <Upload className="w-12 h-12 text-primary mx-auto mb-4" />
               <h3 className="text-lg font-semibold mb-2">Drop files here or click to browse</h3>
               <p className="text-sm text-muted-foreground mb-4">
-                Supports PDF, TXT, DOCX, and slide formats (Text content extraction assumed for MVP)
+                Full support for **TXT**, and new parsing logic for **DOCX** and **PDF**.
               </p>
               {selectedFiles.length > 0 && (
                 <p className="text-sm font-medium text-primary mb-4">
